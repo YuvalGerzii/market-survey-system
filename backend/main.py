@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import logging
@@ -12,6 +12,7 @@ from scrapers.tax_scraper import TaxAuthorityScraper
 from matchers.address_matcher import AddressMatcher
 from models.project import Project, ScrapeStatus
 from config import Config
+from ai.insights import AIInsightsGenerator
 
 # Configure logging
 logging.basicConfig(
@@ -41,6 +42,7 @@ config = Config()
 madlan_scraper = MadlanScraper()
 tax_scraper = TaxAuthorityScraper()
 address_matcher = AddressMatcher()
+ai_insights = AIInsightsGenerator()
 
 # In-memory storage (replace with database in production)
 projects_store = []
@@ -100,14 +102,34 @@ async def trigger_scrape(
 ):
     """Trigger scraping for new data"""
     
-    background_tasks.add_task(run_scraping_task, city, source)
+    # Validate inputs
+    valid_cities = ["tel-aviv", "jerusalem", "haifa", "beer-sheva", "ashdod", "ashkelon"]
+    valid_sources = ["madlan", "tax", "all"]
     
-    return {
-        "message": "Scraping task started",
-        "city": city,
-        "source": source,
-        "status_endpoint": "/api/status"
-    }
+    if city not in valid_cities:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Invalid city. Must be one of: {', '.join(valid_cities)}"
+        )
+    
+    if source not in valid_sources:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Invalid source. Must be one of: {', '.join(valid_sources)}"
+        )
+    
+    try:
+        background_tasks.add_task(run_scraping_task, city, source)
+        
+        return {
+            "message": "Scraping task started",
+            "city": city,
+            "source": source,
+            "status_endpoint": "/api/status"
+        }
+    except Exception as e:
+        logger.error(f"Error starting scraping task: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to start scraping task")
 
 @app.get("/api/status")
 async def get_scrape_status():
@@ -136,6 +158,55 @@ async def clear_projects():
     projects_store.clear()
     return {"message": "All projects cleared"}
 
+@app.get("/api/ai-insights")
+async def get_ai_insights():
+    """Generate AI-powered market insights from current project data"""
+    try:
+        if not projects_store:
+            return {
+                "success": True,
+                "insights": "No project data available for analysis. Please scrape some data first.",
+                "metadata": {
+                    "projects_analyzed": 0,
+                    "generated_at": datetime.now().isoformat()
+                }
+            }
+        
+        insights_result = await ai_insights.generate_insights(projects_store)
+        return insights_result
+        
+    except Exception as e:
+        logger.error(f"Error generating AI insights: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to generate insights")
+
+@app.get("/api/ai-insights/prompt")
+async def get_system_prompt():
+    """Get the current system prompt for AI insights"""
+    return {
+        "system_prompt": ai_insights.get_system_prompt()
+    }
+
+@app.post("/api/ai-insights/prompt")
+async def update_system_prompt(request: Request):
+    """Update the system prompt for AI insights"""
+    try:
+        body = await request.json()
+        new_prompt = body.get("system_prompt", "").strip()
+        
+        if not new_prompt:
+            raise HTTPException(status_code=400, detail="System prompt cannot be empty")
+        
+        ai_insights.update_system_prompt(new_prompt)
+        
+        return {
+            "message": "System prompt updated successfully",
+            "system_prompt": new_prompt
+        }
+        
+    except Exception as e:
+        logger.error(f"Error updating system prompt: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to update system prompt")
+
 async def run_scraping_task(city: str, source: str):
     """Background task for scraping data"""
     
@@ -154,33 +225,52 @@ async def run_scraping_task(city: str, source: str):
         
         # Scrape based on source
         if source in ["madlan", "all"]:
-            logger.info("Scraping Madlan...")
-            madlan_projects = await madlan_scraper.scrape_projects(city)
-            projects.extend(madlan_projects)
-            logger.info(f"Found {len(madlan_projects)} projects from Madlan")
+            try:
+                logger.info("Scraping Madlan...")
+                madlan_projects = await madlan_scraper.scrape_projects(city)
+                projects.extend(madlan_projects)
+                logger.info(f"Found {len(madlan_projects)} projects from Madlan")
+            except Exception as e:
+                error_msg = f"Madlan scraping failed: {str(e)}"
+                logger.error(error_msg)
+                status.errors.append(error_msg)
         
         if source in ["tax", "all"]:
-            logger.info("Scraping Tax Authority...")
-            tax_transactions = await tax_scraper.scrape_transactions(
-                city.replace('-', ' ').title()
-            )
-            transactions.extend(tax_transactions)
-            logger.info(f"Found {len(tax_transactions)} transactions from Tax Authority")
+            try:
+                logger.info("Scraping Tax Authority...")
+                tax_transactions = await tax_scraper.scrape_transactions(
+                    city.replace('-', ' ').title()
+                )
+                transactions.extend(tax_transactions)
+                logger.info(f"Found {len(tax_transactions)} transactions from Tax Authority")
+            except Exception as e:
+                error_msg = f"Tax Authority scraping failed: {str(e)}"
+                logger.error(error_msg)
+                status.errors.append(error_msg)
         
         # Match transactions with projects
         if projects and transactions:
-            logger.info("Matching projects with transactions...")
-            matched_projects = address_matcher.match_projects_with_transactions(
-                projects, transactions
-            )
-            projects = matched_projects
+            try:
+                logger.info("Matching projects with transactions...")
+                matched_projects = address_matcher.match_projects_with_transactions(
+                    projects, transactions
+                )
+                projects = matched_projects
+                logger.info(f"Successfully matched {len(projects)} projects with transactions")
+            except Exception as e:
+                error_msg = f"Address matching failed: {str(e)}"
+                logger.error(error_msg)
+                status.errors.append(error_msg)
         
         # Update global store
         global projects_store
         projects_store = projects
         
         # Update status
-        status.status = "completed"
+        if status.errors:
+            status.status = "completed_with_errors"
+        else:
+            status.status = "completed"
         status.projects_found = len(projects)
         
         logger.info(f"Scraping completed. Found {len(projects)} total projects")
@@ -188,7 +278,7 @@ async def run_scraping_task(city: str, source: str):
     except Exception as e:
         logger.error(f"Scraping failed: {str(e)}")
         status.status = "failed"
-        status.errors.append(str(e))
+        status.errors.append(f"Critical error: {str(e)}")
     
     finally:
         scrape_statuses.append(status)
